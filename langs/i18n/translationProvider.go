@@ -51,7 +51,12 @@ func (tp *TranslationProvider) Update(d *deps.Deps) error {
 	}
 	var newLangs []string
 
-	for _, r := range src.Files() {
+	files, err := src.Files()
+	if err != nil {
+		return err
+	}
+
+	for _, r := range files {
 		currentSpec := language.GetPluralSpec(r.BaseFileName())
 		if currentSpec == nil {
 			// This may is a language code not supported by go-i18n, it may be
@@ -66,7 +71,6 @@ func (tp *TranslationProvider) Update(d *deps.Deps) error {
 
 	// The source files are ordered so the most important comes first. Since this is a
 	// last key win situation, we have to reverse the iteration order.
-	files := src.Files()
 	for i := len(files) - 1; i >= 0; i-- {
 		if err := addTranslationFile(i18nBundle, files[i]); err != nil {
 			return err
@@ -102,12 +106,12 @@ func (tp *TranslationProvider) Clone(d *deps.Deps) error {
 }
 
 func errWithFileContext(inerr error, r source.ReadableFile) error {
-	rfi, ok := r.FileInfo().(hugofs.RealFilenameInfo)
+	fim, ok := r.FileInfo().(hugofs.FileMetaInfo)
 	if !ok {
 		return inerr
 	}
 
-	realFilename := rfi.RealFilename()
+	realFilename := fim.Meta().Filename()
 	f, err := r.Open()
 	if err != nil {
 		return inerr

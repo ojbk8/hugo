@@ -16,10 +16,14 @@
 package filesystems
 
 import (
-	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/pkg/errors"
+
+	"github.com/gohugoio/hugo/modules"
 
 	"github.com/gohugoio/hugo/config"
 
@@ -51,10 +55,28 @@ type BaseFs struct {
 	// This usually maps to /my-project/public.
 	PublishFs afero.Fs
 
-	themeFs afero.Fs
+	theBigFs *filesystemsCollector
 
 	// TODO(bep) improve the "theme interaction"
 	AbsThemeDirs []string
+}
+
+func (fs *BaseFs) WatchDirs() []hugofs.FileMetaInfo {
+	var dirs []hugofs.FileMetaInfo
+	for _, dirSet := range [][]hugofs.FileMetaInfo{
+		fs.I18n.Dirs,
+		fs.Data.Dirs,
+		fs.Content.Dirs,
+		fs.Assets.Dirs,
+	} {
+		for _, dir := range dirSet {
+			if dir.Meta().Watch() {
+				dirs = append(dirs, dir)
+			}
+		}
+	}
+
+	return dirs
 }
 
 // RelContentDir tries to create a path relative to the content root from
@@ -95,9 +117,14 @@ type SourceFilesystems struct {
 // A SourceFilesystem holds the filesystem for a given source type in Hugo (data,
 // i18n, layouts, static) and additional metadata to be able to use that filesystem
 // in server mode.
+// TODO(bep) mod clean up
 type SourceFilesystem struct {
 	// This is a virtual composite filesystem. It expects path relative to a context.
 	Fs afero.Fs
+
+	// This filesystem as separate root directories, starting from project and down
+	// to the themes/modules.
+	Dirs []hugofs.FileMetaInfo
 
 	// This is the base source filesystem. In real Hugo, this will be the OS filesystem.
 	// Use this if you need to resolve items in Dirnames below.
@@ -220,8 +247,8 @@ func (d *SourceFilesystem) RealFilename(rel string) string {
 	if err != nil {
 		return rel
 	}
-	if realfi, ok := fi.(hugofs.RealFilenameInfo); ok {
-		return realfi.RealFilename()
+	if realfi, ok := fi.(hugofs.FileMetaInfo); ok {
+		return realfi.Meta().Filename()
 	}
 
 	return rel
@@ -254,14 +281,14 @@ func (d *SourceFilesystem) RealDirs(from string) []string {
 // the same across sites/languages.
 func WithBaseFs(b *BaseFs) func(*BaseFs) error {
 	return func(bb *BaseFs) error {
-		bb.themeFs = b.themeFs
+		bb.theBigFs = b.theBigFs
 		bb.AbsThemeDirs = b.AbsThemeDirs
 		return nil
 	}
 }
 
 func newRealBase(base afero.Fs) afero.Fs {
-	return hugofs.NewBasePathRealFilenameFs(base.(*afero.BasePathFs))
+	return hugofs.NewBasePathPathDecorator(base.(*afero.BasePathFs))
 
 }
 
@@ -270,23 +297,6 @@ func NewBase(p *paths.Paths, options ...func(*BaseFs) error) (*BaseFs, error) {
 	fs := p.Fs
 
 	publishFs := afero.NewBasePathFs(fs.Destination, p.AbsPublishDir)
-
-	contentFs, absContentDirs, err := createContentFs(fs.Source, p.WorkingDir, p.DefaultContentLanguage, p.Languages)
-	if err != nil {
-		return nil, err
-	}
-
-	// Make sure we don't have any overlapping content dirs. That will never work.
-	for i, d1 := range absContentDirs {
-		for j, d2 := range absContentDirs {
-			if i == j {
-				continue
-			}
-			if strings.HasPrefix(d1, d2) || strings.HasPrefix(d2, d1) {
-				return nil, fmt.Errorf("found overlapping content dirs (%q and %q)", d1, d2)
-			}
-		}
-	}
 
 	b := &BaseFs{
 		PublishFs: publishFs,
@@ -301,99 +311,102 @@ func NewBase(p *paths.Paths, options ...func(*BaseFs) error) (*BaseFs, error) {
 	builder := newSourceFilesystemsBuilder(p, b)
 	sourceFilesystems, err := builder.Build()
 	if err != nil {
-		return nil, err
-	}
-
-	sourceFilesystems.Content = &SourceFilesystem{
-		SourceFs: fs.Source,
-		Fs:       contentFs,
-		Dirnames: absContentDirs,
+		return nil, errors.Wrap(err, "build filesystems")
 	}
 
 	b.SourceFilesystems = sourceFilesystems
-	b.themeFs = builder.themeFs
-	b.AbsThemeDirs = builder.absThemeDirs
+	b.theBigFs = builder.theBigFs
+	// TODO(bep) mod	b.AbsThemeDirs = builder.absThemeDirs
 
 	return b, nil
 }
 
 type sourceFilesystemsBuilder struct {
-	p            *paths.Paths
-	result       *SourceFilesystems
-	themeFs      afero.Fs
-	hasTheme     bool
-	absThemeDirs []string
+	p        *paths.Paths
+	sourceFs afero.Fs
+	result   *SourceFilesystems
+	theBigFs *filesystemsCollector
 }
 
 func newSourceFilesystemsBuilder(p *paths.Paths, b *BaseFs) *sourceFilesystemsBuilder {
-	return &sourceFilesystemsBuilder{p: p, themeFs: b.themeFs, absThemeDirs: b.AbsThemeDirs, result: &SourceFilesystems{}}
+	sourceFs := hugofs.NewFilenameDecorator(p.Fs.Source)
+	return &sourceFilesystemsBuilder{p: p, sourceFs: sourceFs, theBigFs: b.theBigFs, result: &SourceFilesystems{}}
 }
 
 func (b *sourceFilesystemsBuilder) Build() (*SourceFilesystems, error) {
-	if b.themeFs == nil && b.p.ThemeSet() {
-		themeFs, absThemeDirs, err := createThemesOverlayFs(b.p)
+
+	if b.theBigFs == nil {
+		projectMounts, err := b.createProjectMounts()
 		if err != nil {
 			return nil, err
 		}
-		if themeFs == nil {
+
+		theBigFs, err := b.createMainOverlayFs(projectMounts, b.p)
+		if err != nil {
+			return nil, errors.Wrap(err, "create main fs")
+		}
+		if theBigFs.overlay == nil {
 			panic("createThemesFs returned nil")
 		}
-		b.themeFs = themeFs
-		b.absThemeDirs = absThemeDirs
-
+		b.theBigFs = theBigFs
 	}
 
-	b.hasTheme = len(b.absThemeDirs) > 0
+	createView := func(id string, dirs []hugofs.FileMetaInfo) *SourceFilesystem {
+		if b.theBigFs == nil {
+			panic("no fs")
+		}
+		if b.theBigFs.overlay == nil {
+			panic("no overlay")
+		}
 
-	sfs, err := b.createRootMappingFs("dataDir", "data")
-	if err != nil {
-		return nil, err
+		return &SourceFilesystem{
+			Fs:   afero.NewBasePathFs(b.theBigFs.overlay, id),
+			Dirs: dirs,
+		}
 	}
-	b.result.Data = sfs
 
-	sfs, err = b.createRootMappingFs("i18nDir", "i18n")
-	if err != nil {
-		return nil, err
-	}
-	b.result.I18n = sfs
+	b.result.Archetypes = createView("archetypes", nil)
+	b.result.Layouts = createView("layouts", b.theBigFs.layoutsDirs)
+	b.result.Assets = createView("assets", b.theBigFs.assetsDirs)
 
-	sfs, err = b.createFs(false, true, "layoutDir", "layouts")
-	if err != nil {
-		return nil, err
-	}
-	b.result.Layouts = sfs
-
-	sfs, err = b.createFs(false, true, "archetypeDir", "archetypes")
-	if err != nil {
-		return nil, err
-	}
-	b.result.Archetypes = sfs
-
-	sfs, err = b.createFs(false, true, "assetDir", "assets")
-	if err != nil {
-		return nil, err
-	}
-	b.result.Assets = sfs
-
-	sfs, err = b.createFs(true, false, "resourceDir", "resources")
+	// Data, i18n and content cannot use the overlay fs
+	dataFs, err := hugofs.NewSliceFs(hugofs.ToFileMetas(b.theBigFs.dataDirs...)...)
 	if err != nil {
 		return nil, err
 	}
 
-	b.result.Resources = sfs
+	b.result.Data = &SourceFilesystem{Fs: dataFs, Dirs: b.theBigFs.dataDirs}
 
-	sfs, err = b.createFs(false, true, "", "")
+	i18nFs, err := hugofs.NewSliceFs(hugofs.ToFileMetas(b.theBigFs.i18nDirs...)...)
 	if err != nil {
 		return nil, err
 	}
-	b.result.Work = sfs
+	b.result.I18n = &SourceFilesystem{Fs: i18nFs, Dirs: b.theBigFs.i18nDirs}
 
-	err = b.createStaticFs()
+	//b.result.Static = createView("static")
+
+	// TODO(bep) mod contentFilesystems probably needs to be reversed
+	contentDirs := b.theBigFs.contentDirs
+
+	contentFs, err := hugofs.NewLanguageFs(b.p.Languages.AsSet(), hugofs.ToFileMetas(contentDirs...)...)
+	if err != nil {
+		return nil, errors.Wrap(err, "create content filesystem")
+	}
+	b.result.Content = &SourceFilesystem{
+		Fs:   contentFs,
+		Dirs: contentDirs,
+	}
+
+	// This is a project only fs and needs to be writable.
+	rfs, err := b.createFs(true, false, "resourceDir", "resources")
 	if err != nil {
 		return nil, err
 	}
 
-	return b.result, nil
+	b.result.Resources = rfs
+
+	return b.result, err
+
 }
 
 func (b *sourceFilesystemsBuilder) createFs(
@@ -401,7 +414,7 @@ func (b *sourceFilesystemsBuilder) createFs(
 	readOnly bool,
 	dirKey, themeFolder string) (*SourceFilesystem, error) {
 	s := &SourceFilesystem{
-		SourceFs: b.p.Fs.Source,
+		SourceFs: b.sourceFs,
 	}
 
 	if themeFolder == "" {
@@ -422,32 +435,37 @@ func (b *sourceFilesystemsBuilder) createFs(
 	existsInSource := b.existsInSource(absDir)
 	if !existsInSource && mkdir {
 		// We really need this directory. Make it.
-		if err := b.p.Fs.Source.MkdirAll(absDir, 0777); err == nil {
+		if err := b.sourceFs.MkdirAll(absDir, 0777); err == nil {
 			existsInSource = true
 		}
 	}
 	if existsInSource {
-		fs = newRealBase(afero.NewBasePathFs(b.p.Fs.Source, absDir))
+		fs = newRealBase(afero.NewBasePathFs(b.sourceFs, absDir))
 		s.Dirnames = []string{absDir}
 	}
 
-	if b.hasTheme {
+	if b.hasModules() {
 		if !strings.HasPrefix(themeFolder, filePathSeparator) {
 			themeFolder = filePathSeparator + themeFolder
 		}
-		themeFolderFs := newRealBase(afero.NewBasePathFs(b.themeFs, themeFolder))
+		bfs := afero.NewBasePathFs(b.theBigFs.overlay, themeFolder)
+		themeFolderFs := newRealBase(bfs)
+
 		if fs == nil {
 			fs = themeFolderFs
 		} else {
 			fs = afero.NewCopyOnWriteFs(themeFolderFs, fs)
 		}
 
-		for _, absThemeDir := range b.absThemeDirs {
-			absThemeFolderDir := filepath.Join(absThemeDir, themeFolder)
-			if b.existsInSource(absThemeFolderDir) {
-				s.Dirnames = append(s.Dirnames, absThemeFolderDir)
+		// TODO(bep) mod
+		/*
+			for _, absThemeDir := range b.absThemeDirs {
+				absThemeFolderDir := filepath.Join(absThemeDir, themeFolder)
+				if b.existsInSource(absThemeFolderDir) {
+					s.Dirnames = append(s.Dirnames, absThemeFolderDir)
+				}
 			}
-		}
+		*/
 	}
 
 	if fs == nil {
@@ -461,52 +479,12 @@ func (b *sourceFilesystemsBuilder) createFs(
 	return s, nil
 }
 
-// Used for data, i18n -- we cannot use overlay filsesystems for those, but we need
-// to keep a strict order.
-func (b *sourceFilesystemsBuilder) createRootMappingFs(dirKey, themeFolder string) (*SourceFilesystem, error) {
-	s := &SourceFilesystem{
-		SourceFs: b.p.Fs.Source,
-	}
-
-	projectDir := b.p.Cfg.GetString(dirKey)
-	if projectDir == "" {
-		return nil, fmt.Errorf("config %q not set", dirKey)
-	}
-
-	var fromTo []string
-	to := b.p.AbsPathify(projectDir)
-
-	if b.existsInSource(to) {
-		s.Dirnames = []string{to}
-		fromTo = []string{projectVirtualFolder, to}
-	}
-
-	for _, theme := range b.p.AllThemes {
-		to := b.p.AbsPathify(filepath.Join(b.p.ThemesDir, theme.Name, themeFolder))
-		if b.existsInSource(to) {
-			s.Dirnames = append(s.Dirnames, to)
-			from := theme
-			fromTo = append(fromTo, from.Name, to)
-		}
-	}
-
-	if len(fromTo) == 0 {
-		s.Fs = hugofs.NoOpFs
-		return s, nil
-	}
-
-	fs, err := hugofs.NewRootMappingFs(b.p.Fs.Source, fromTo...)
-	if err != nil {
-		return nil, err
-	}
-
-	s.Fs = afero.NewReadOnlyFs(fs)
-
-	return s, nil
+func (b *sourceFilesystemsBuilder) hasModules() bool {
+	return len(b.p.AllModules) > 0
 }
 
 func (b *sourceFilesystemsBuilder) existsInSource(abspath string) bool {
-	exists, _ := afero.Exists(b.p.Fs.Source, abspath)
+	exists, _ := afero.Exists(b.sourceFs, abspath)
 	return exists
 }
 
@@ -518,7 +496,7 @@ func (b *sourceFilesystemsBuilder) createStaticFs() error {
 	if isMultihost {
 		for _, l := range b.p.Languages {
 			s := &SourceFilesystem{
-				SourceFs:      b.p.Fs.Source,
+				SourceFs:      b.sourceFs,
 				PublishFolder: l.Lang}
 			staticDirs := removeDuplicatesKeepRight(getStaticDirs(l))
 			if len(staticDirs) == 0 {
@@ -534,17 +512,18 @@ func (b *sourceFilesystemsBuilder) createStaticFs() error {
 				s.Dirnames = append(s.Dirnames, absDir)
 			}
 
-			fs, err := createOverlayFs(b.p.Fs.Source, s.Dirnames)
+			fs, err := createOverlayFs(b.sourceFs, s.Dirnames)
 			if err != nil {
 				return err
 			}
 
-			if b.hasTheme {
+			if b.hasModules() {
 				themeFolder := "static"
-				fs = afero.NewCopyOnWriteFs(newRealBase(afero.NewBasePathFs(b.themeFs, themeFolder)), fs)
-				for _, absThemeDir := range b.absThemeDirs {
+				fs = afero.NewCopyOnWriteFs(newRealBase(afero.NewBasePathFs(b.theBigFs.overlay, themeFolder)), fs)
+				// TODO(bep) mod
+				/*for _, absThemeDir := range b.absThemeDirs {
 					s.Dirnames = append(s.Dirnames, filepath.Join(absThemeDir, themeFolder))
-				}
+				}*/
 			}
 
 			s.Fs = fs
@@ -556,7 +535,7 @@ func (b *sourceFilesystemsBuilder) createStaticFs() error {
 	}
 
 	s := &SourceFilesystem{
-		SourceFs: b.p.Fs.Source,
+		SourceFs: b.sourceFs,
 	}
 
 	var staticDirs []string
@@ -578,17 +557,18 @@ func (b *sourceFilesystemsBuilder) createStaticFs() error {
 		s.Dirnames = append(s.Dirnames, absDir)
 	}
 
-	fs, err := createOverlayFs(b.p.Fs.Source, s.Dirnames)
+	fs, err := createOverlayFs(b.sourceFs, s.Dirnames)
 	if err != nil {
 		return err
 	}
 
-	if b.hasTheme {
+	if b.hasModules() {
 		themeFolder := "static"
-		fs = afero.NewCopyOnWriteFs(newRealBase(afero.NewBasePathFs(b.themeFs, themeFolder)), fs)
-		for _, absThemeDir := range b.absThemeDirs {
+		fs = afero.NewCopyOnWriteFs(newRealBase(afero.NewBasePathFs(b.theBigFs.overlay, themeFolder)), fs)
+		// TODO(bep) mod
+		/*for _, absThemeDir := range b.absThemeDirs {
 			s.Dirnames = append(s.Dirnames, filepath.Join(absThemeDir, themeFolder))
-		}
+		}*/
 	}
 
 	s.Fs = fs
@@ -615,10 +595,55 @@ func getStringOrStringSlice(cfg config.Provider, key string, id int) []string {
 
 }
 
-func createContentFs(fs afero.Fs,
-	workingDir,
-	defaultContentLanguage string,
-	languages langs.Languages) (afero.Fs, []string, error) {
+func (b *sourceFilesystemsBuilder) createProjectMounts() (mountsDescriptor, error) {
+
+	contentMounts, err := b.createContentMounts()
+	if err != nil {
+		return mountsDescriptor{}, err
+	}
+
+	getDir := func(id string) string {
+		return b.p.Cfg.GetString(id)
+	}
+
+	i18nDir := getDir("i18nDir")
+	layoutsDir := getDir("layoutDir")
+	dataDir := getDir("dataDir")
+	archetypeDir := getDir("archetypeDir")
+
+	assetsDir := getDir("assetDir")
+	resourcesDir := getDir("resourceDir")
+
+	// TODO(bep)
+	staticDir := getDir("staticDir")
+
+	mounts := []modules.Mount{
+		modules.Mount{Source: i18nDir, Target: "i18n"},
+		modules.Mount{Source: layoutsDir, Target: "layouts"},
+		modules.Mount{Source: dataDir, Target: "data"},
+		modules.Mount{Source: archetypeDir, Target: "archetypes"},
+		modules.Mount{Source: staticDir, Target: "static"},
+
+		modules.Mount{Source: assetsDir, Target: "assets"},
+		modules.Mount{Source: resourcesDir, Target: "resources"},
+	}
+
+	mounts = append(contentMounts, mounts...)
+
+	return mountsDescriptor{
+		mounts:        mounts,
+		dir:           b.p.WorkingDir,
+		isMainProject: true,
+		watch:         true,
+	}, nil
+
+	// TODO(bep) mod static, archetype etc + check
+}
+
+func (b *sourceFilesystemsBuilder) createContentMounts() ([]modules.Mount, error) {
+
+	defaultContentLanguage := b.p.DefaultContentLanguage
+	languages := b.p.Languages
 
 	var contentLanguages langs.Languages
 	var contentDirSeen = make(map[string]bool)
@@ -645,87 +670,195 @@ func createContentFs(fs afero.Fs,
 
 	}
 
-	var absContentDirs []string
+	mounts := make([]modules.Mount, len(contentLanguages))
 
-	fs, err := createContentOverlayFs(fs, workingDir, contentLanguages, languageSet, &absContentDirs)
-	return fs, absContentDirs, err
+	for i, language := range contentLanguages {
+		mounts[i] = modules.Mount{
+			Source: b.p.AbsPathify(language.ContentDir),
+			Target: "content",
+			Lang:   language.Lang,
+		}
+	}
+
+	return mounts, nil
 
 }
 
-func createContentOverlayFs(source afero.Fs,
-	workingDir string,
-	languages langs.Languages,
-	languageSet map[string]bool,
-	absContentDirs *[]string) (afero.Fs, error) {
-	if len(languages) == 0 {
-		return source, nil
+func (b *sourceFilesystemsBuilder) createMainOverlayFs(projectMounts mountsDescriptor, p *paths.Paths) (*filesystemsCollector, error) {
+
+	mods := p.AllModules
+
+	if len(mods) == 0 {
+		panic("AllModules not set")
 	}
 
-	language := languages[0]
+	modsReversed := make([]mountsDescriptor, len(mods)+1)
 
-	contentDir := language.ContentDir
-	if contentDir == "" {
-		panic("missing contentDir")
-	}
-
-	absContentDir := paths.AbsPathify(workingDir, language.ContentDir)
-	if !strings.HasSuffix(absContentDir, paths.FilePathSeparator) {
-		absContentDir += paths.FilePathSeparator
-	}
-
-	// If root, remove the second '/'
-	if absContentDir == "//" {
-		absContentDir = paths.FilePathSeparator
-	}
-
-	if len(absContentDir) < 6 {
-		return nil, fmt.Errorf("invalid content dir %q: Path is too short", absContentDir)
-	}
-
-	*absContentDirs = append(*absContentDirs, absContentDir)
-
-	overlay := hugofs.NewLanguageFs(language.Lang, languageSet, afero.NewBasePathFs(source, absContentDir))
-	if len(languages) == 1 {
-		return overlay, nil
-	}
-
-	base, err := createContentOverlayFs(source, workingDir, languages[1:], languageSet, absContentDirs)
-	if err != nil {
-		return nil, err
-	}
-
-	return hugofs.NewLanguageCompositeFs(base, overlay), nil
-
-}
-
-func createThemesOverlayFs(p *paths.Paths) (afero.Fs, []string, error) {
-
-	themes := p.AllThemes
-
-	if len(themes) == 0 {
-		panic("AllThemes not set")
-	}
-
-	themesDir := p.AbsPathify(p.ThemesDir)
-	if themesDir == "" {
-		return nil, nil, errors.New("no themes dir set")
-	}
-
-	absPaths := make([]string, len(themes))
+	modsReversed[0] = projectMounts
 
 	// The themes are ordered from left to right. We need to revert it to get the
 	// overlay logic below working as expected.
-	for i := 0; i < len(themes); i++ {
-		absPaths[i] = filepath.Join(themesDir, themes[len(themes)-1-i].Name)
+	for i := len(modsReversed) - 1; i > 0; i-- {
+		mod := mods[i-1]
+		modsReversed[i] = mountsDescriptor{
+			mounts: mod.Mounts(),
+			dir:    mod.Dir(),
+			watch:  !mod.IsGoMod(), // TODO(bep) mod consider Replace
+		}
 	}
 
-	fs, err := createOverlayFs(p.Fs.Source, absPaths)
-	fs = hugofs.NewNoLstatFs(fs)
+	collector := &filesystemsCollector{
+		sourceProject: b.sourceFs,
+		sourceModules: b.sourceFs, // TODO(bep) mod: add a no symlinc fs
+	}
 
-	return fs, absPaths, err
+	err := b.createOverlayFs(collector, modsReversed)
+
+	return collector, err
 
 }
 
+func (b *sourceFilesystemsBuilder) isContentMount(mnt modules.Mount) bool {
+	return strings.HasPrefix(mnt.Target, "content")
+}
+
+func (b *sourceFilesystemsBuilder) createModFs(
+	collector *filesystemsCollector,
+	md mountsDescriptor) error {
+
+	var fromTo []hugofs.RootMapping
+
+	absPathify := func(path string) string {
+		return paths.AbsPathify(md.dir, path)
+	}
+
+	for _, mount := range md.mounts {
+		rm := hugofs.RootMapping{
+			From: mount.Target,
+			To:   absPathify(mount.Source),
+			Meta: hugofs.FileMeta{
+				"watch": md.watch,
+			},
+		}
+
+		if b.isContentMount(mount) {
+			lang := mount.Lang
+			if lang == "" {
+				lang = b.p.DefaultContentLanguage
+			}
+			rm.Meta["lang"] = lang
+		}
+		fromTo = append(fromTo, rm)
+	}
+
+	modBase := collector.sourceProject
+	if !md.isMainProject {
+		modBase = collector.sourceModules
+	}
+
+	rmfs, err := hugofs.NewRootMappingFs(modBase, fromTo...)
+	if err != nil {
+		return err
+	}
+
+	// These need special merge.
+	contentDirs, err := rmfs.Dirs("content")
+	if err != nil {
+		return err
+	}
+
+	dataDirs, err := rmfs.Dirs("data")
+	if err != nil {
+		return err
+	}
+
+	i18nDirs, err := rmfs.Dirs("i18n")
+	if err != nil {
+		return err
+	}
+
+	// We need these to get the watch dir list
+	assetsDirs, err := rmfs.Dirs("assets")
+	if err != nil {
+		return err
+	}
+	layoutsDirs, err := rmfs.Dirs("layouts")
+	if err != nil {
+		return err
+	}
+
+	collector.contentDirs = append(collector.contentDirs, contentDirs...)
+	collector.dataDirs = append(collector.dataDirs, dataDirs...)
+	collector.i18nDirs = append(collector.i18nDirs, i18nDirs...)
+	collector.layoutsDirs = append(collector.layoutsDirs, layoutsDirs...)
+	collector.assetsDirs = append(collector.assetsDirs, assetsDirs...)
+
+	if collector.overlay == nil {
+		collector.overlay = rmfs
+	} else {
+		collector.overlay = afero.NewCopyOnWriteFs(collector.overlay, rmfs)
+	}
+
+	return nil
+
+}
+
+func printFs(fs afero.Fs, path string, w io.Writer) {
+	if fs == nil {
+		return
+	}
+	afero.Walk(fs, path, func(path string, info os.FileInfo, err error) error {
+		fmt.Println("p:::", path)
+		return nil
+	})
+}
+
+const contentBase = "content"
+
+type filesystemsCollector struct {
+	sourceProject afero.Fs // Source for project folders
+	sourceModules afero.Fs // Source for modules/themes
+
+	overlay afero.Fs
+
+	watchDirs []string // TODO(bep) mod
+
+	// These need special merge.
+	contentDirs []hugofs.FileMetaInfo
+	i18nDirs    []hugofs.FileMetaInfo
+	dataDirs    []hugofs.FileMetaInfo
+
+	// Collect these to get a complete watch dirs list
+	// TODO(bep) mod static
+	layoutsDirs []hugofs.FileMetaInfo
+	assetsDirs  []hugofs.FileMetaInfo
+}
+
+type mountsDescriptor struct {
+	mounts        []modules.Mount
+	dir           string
+	watch         bool // whether this is a candidate for watching in server mode.
+	isMainProject bool
+}
+
+func (b *sourceFilesystemsBuilder) createOverlayFs(collector *filesystemsCollector, mounts []mountsDescriptor) error {
+	if len(mounts) == 0 {
+		return nil
+	}
+
+	err := b.createModFs(collector, mounts[0])
+	if err != nil {
+		return err
+	}
+
+	if len(mounts) == 1 {
+		return nil
+	}
+
+	return b.createOverlayFs(collector, mounts[1:])
+}
+
+// TODO(bep) mod remove
 func createOverlayFs(source afero.Fs, absPaths []string) (afero.Fs, error) {
 	if len(absPaths) == 0 {
 		return hugofs.NoOpFs, nil
