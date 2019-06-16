@@ -435,7 +435,7 @@ func decorateFileInfo(
 	}
 
 	if opener != nil {
-		meta.setIfNotZero(metaKeyOpener, opener)
+		meta[metaKeyOpener] = opener
 	}
 
 	if fi.IsDir() && fs != nil { // TODO(bep) mod check + argument

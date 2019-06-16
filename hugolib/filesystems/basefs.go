@@ -36,11 +36,6 @@ import (
 	"github.com/spf13/afero"
 )
 
-// When we create a virtual filesystem with data and i18n bundles for the project and the themes,
-// this is the name of the project's virtual root. It got it's funky name to make sure
-// (or very unlikely) that it collides with a theme name.
-const projectVirtualFolder = "__h__project"
-
 var filePathSeparator = string(filepath.Separator)
 
 // BaseFs contains the core base filesystems used by Hugo. The name "base" is used
@@ -82,7 +77,8 @@ func (fs *BaseFs) WatchDirs() []hugofs.FileMetaInfo {
 // RelContentDir tries to create a path relative to the content root from
 // the given filename. The return value is the path and language code.
 func (b *BaseFs) RelContentDir(filename string) string {
-	for _, dirname := range b.SourceFilesystems.Content.Dirnames {
+	for _, dir := range b.SourceFilesystems.Content.Dirs {
+		dirname := dir.Meta().Filename()
 		if strings.HasPrefix(filename, dirname) {
 			rel := strings.TrimPrefix(filename, dirname)
 			return strings.TrimPrefix(rel, filePathSeparator)
@@ -256,8 +252,8 @@ func (d *SourceFilesystem) RealFilename(rel string) string {
 
 // Contains returns whether the given filename is a member of the current filesystem.
 func (d *SourceFilesystem) Contains(filename string) bool {
-	for _, dir := range d.Dirnames {
-		if strings.HasPrefix(filename, dir) {
+	for _, dir := range d.Dirs {
+		if strings.HasPrefix(filename, dir.Meta().Filename()) {
 			return true
 		}
 	}
@@ -374,7 +370,6 @@ func (b *sourceFilesystemsBuilder) Build() (*SourceFilesystems, error) {
 	if err != nil {
 		return nil, err
 	}
-
 	b.result.Data = &SourceFilesystem{Fs: dataFs, Dirs: b.theBigFs.dataDirs}
 
 	i18nFs, err := hugofs.NewSliceFs(hugofs.ToFileMetas(b.theBigFs.i18nDirs...)...)
@@ -382,8 +377,6 @@ func (b *sourceFilesystemsBuilder) Build() (*SourceFilesystems, error) {
 		return nil, err
 	}
 	b.result.I18n = &SourceFilesystem{Fs: i18nFs, Dirs: b.theBigFs.i18nDirs}
-
-	//b.result.Static = createView("static")
 
 	// TODO(bep) mod contentFilesystems probably needs to be reversed
 	contentDirs := b.theBigFs.contentDirs
@@ -602,6 +595,11 @@ func (b *sourceFilesystemsBuilder) createProjectMounts() (mountsDescriptor, erro
 		return mountsDescriptor{}, err
 	}
 
+	staticMounts, err := b.createStaticMounts()
+	if err != nil {
+		return mountsDescriptor{}, err
+	}
+
 	getDir := func(id string) string {
 		return b.p.Cfg.GetString(id)
 	}
@@ -614,21 +612,18 @@ func (b *sourceFilesystemsBuilder) createProjectMounts() (mountsDescriptor, erro
 	assetsDir := getDir("assetDir")
 	resourcesDir := getDir("resourceDir")
 
-	// TODO(bep)
-	staticDir := getDir("staticDir")
-
 	mounts := []modules.Mount{
 		modules.Mount{Source: i18nDir, Target: "i18n"},
 		modules.Mount{Source: layoutsDir, Target: "layouts"},
 		modules.Mount{Source: dataDir, Target: "data"},
 		modules.Mount{Source: archetypeDir, Target: "archetypes"},
-		modules.Mount{Source: staticDir, Target: "static"},
 
 		modules.Mount{Source: assetsDir, Target: "assets"},
 		modules.Mount{Source: resourcesDir, Target: "resources"},
 	}
 
 	mounts = append(contentMounts, mounts...)
+	mounts = append(staticMounts, mounts...)
 
 	return mountsDescriptor{
 		mounts:        mounts,
@@ -640,6 +635,39 @@ func (b *sourceFilesystemsBuilder) createProjectMounts() (mountsDescriptor, erro
 	// TODO(bep) mod static, archetype etc + check
 }
 
+func (b *sourceFilesystemsBuilder) createStaticMounts() ([]modules.Mount, error) {
+	isMultihost := b.p.Cfg.GetBool("multihost")
+	languages := b.p.Languages
+	var mounts []modules.Mount
+
+	if isMultihost {
+		for _, language := range languages {
+			dirs := removeDuplicatesKeepRight(getStaticDirs(language))
+			for _, dir := range dirs {
+				mounts = append(mounts, modules.Mount{
+					Source: b.p.AbsPathify(dir),
+					Target: "static",
+					Lang:   language.Lang,
+				})
+			}
+		}
+	} else {
+		// Just create one big filesystem.
+		var dirs []string
+		for _, language := range languages {
+			dirs = append(dirs, removeDuplicatesKeepRight(getStaticDirs(language))...)
+		}
+
+		for _, dir := range dirs {
+			mounts = append(mounts, modules.Mount{
+				Source: b.p.AbsPathify(dir),
+				Target: "static",
+			})
+		}
+	}
+
+	return mounts, nil
+}
 func (b *sourceFilesystemsBuilder) createContentMounts() ([]modules.Mount, error) {
 
 	defaultContentLanguage := b.p.DefaultContentLanguage
@@ -714,6 +742,7 @@ func (b *sourceFilesystemsBuilder) createMainOverlayFs(projectMounts mountsDescr
 
 	err := b.createOverlayFs(collector, modsReversed)
 
+	collector.overlay = hugofs.NewCompositeDirDecorator(collector.overlay)
 	return collector, err
 
 }

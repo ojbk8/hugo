@@ -65,6 +65,23 @@ func NewFilenameDecorator(fs afero.Fs) *FilenameDecoratorFs {
 	return ffs
 }
 
+// NewCompositeDirDecorator decorates the given filesystem to make sure
+// that directories is always opened by that filesystem.
+func NewCompositeDirDecorator(fs afero.Fs) *FilenameDecoratorFs {
+
+	decorator := func(fi os.FileInfo, name string) (os.FileInfo, error) {
+		if !fi.IsDir() {
+			return fi, nil
+		}
+		opener := func() (afero.File, error) {
+			return fs.Open(name)
+		}
+		return decorateFileInfo(fs, opener, fi, "", "", nil), nil
+	}
+
+	return &FilenameDecoratorFs{Fs: fs, decorate: decorator}
+}
+
 // BasePathRealFilenameFs is a thin wrapper around afero.BasePathFs that
 // provides the real filename in Stat and LstatIfPossible.
 type FilenameDecoratorFs struct {
@@ -88,9 +105,11 @@ func (fs *FilenameDecoratorFs) Stat(name string) (os.FileInfo, error) {
 // It attempts to use Lstat if supported or defers to the os.  In addition to
 // the FileInfo, a boolean is returned telling whether Lstat was called.
 func (b *FilenameDecoratorFs) LstatIfPossible(name string) (os.FileInfo, bool, error) {
-	var fi os.FileInfo
-	var err error
-	var ok bool
+	var (
+		fi  os.FileInfo
+		err error
+		ok  bool
+	)
 
 	if lstater, isLstater := b.Fs.(afero.Lstater); isLstater {
 		fi, ok, err = lstater.LstatIfPossible(name)

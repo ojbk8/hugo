@@ -18,6 +18,8 @@ import (
 	"path/filepath"
 	"sort"
 
+	"github.com/pkg/errors"
+
 	"github.com/spf13/afero"
 )
 
@@ -71,6 +73,10 @@ func (w *Walkway) Walk() error {
 			return w.walkFn(nil, err)
 		}
 		fi = info.(FileMetaInfo)
+	}
+
+	if !fi.IsDir() {
+		return w.walkFn(nil, errors.New("file to walk must be a directory"))
 	}
 
 	return w.walk(w.fs, fi, w.walkFn)
