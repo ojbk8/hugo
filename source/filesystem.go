@@ -34,6 +34,8 @@ type Filesystem struct {
 
 	Base string
 
+	fi hugofs.FileMetaInfo
+
 	SourceSpec
 }
 
@@ -45,6 +47,10 @@ type Input interface {
 // NewFilesystem returns a new filesytem for a given source spec.
 func (sp SourceSpec) NewFilesystem(base string) *Filesystem {
 	return &Filesystem{SourceSpec: sp, Base: base}
+}
+
+func (sp SourceSpec) NewFilesystemFromFileMetaInfo(fi hugofs.FileMetaInfo) *Filesystem {
+	return &Filesystem{SourceSpec: sp, fi: fi}
 }
 
 // Files returns a slice of readable files.
@@ -102,11 +108,17 @@ func (f *Filesystem) captureFiles() error {
 		return err
 	}
 
-	if f.SourceFs == nil {
-		panic("Must have a fs")
+	var w *hugofs.Walkway
+	if f.fi != nil {
+		w = hugofs.NewWalkwayFromFi(f.fi, walker)
+	} else {
+		if f.SourceFs == nil {
+			panic("Must have a fs")
+		}
+
+		w = hugofs.NewWalkway(f.SourceFs, f.Base, walker)
 	}
 
-	w := hugofs.NewWalkway(f.SourceFs, f.Base, walker)
 	return w.Walk()
 
 }

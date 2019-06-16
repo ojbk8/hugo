@@ -21,6 +21,24 @@ import (
 	"github.com/spf13/afero"
 )
 
+func NewPathDecorator(fs afero.Fs, base string) *FilenameDecoratorFs {
+	ffs := &FilenameDecoratorFs{Fs: fs}
+
+	decorator := func(fi os.FileInfo, name string) (os.FileInfo, error) {
+		path := strings.TrimPrefix(name, base)
+		path = strings.TrimLeft(path, string(os.PathSeparator))
+		opener := func() (afero.File, error) {
+			return ffs.Open(name)
+		}
+		return decorateFileInfo("path-decorator", fs, opener, fi, "", path, nil), nil
+	}
+
+	ffs.decorate = decorator
+
+	return ffs
+
+}
+
 // NewBasePathPathDecorator returns a new Fs that adds path information
 // to the os.FileInfo provided by base.
 func NewBasePathPathDecorator(base *afero.BasePathFs) *FilenameDecoratorFs {
@@ -40,7 +58,7 @@ func NewBasePathPathDecorator(base *afero.BasePathFs) *FilenameDecoratorFs {
 			return ffs.Open(name)
 		}
 
-		return decorateFileInfo(base, opener, fi, "", path, nil), nil
+		return decorateFileInfo("basepath-decorator", base, opener, fi, "", path, nil), nil
 	}
 
 	ffs.decorate = decorator
@@ -58,7 +76,7 @@ func NewFilenameDecorator(fs afero.Fs) *FilenameDecoratorFs {
 		opener := func() (afero.File, error) {
 			return ffs.Open(name)
 		}
-		return decorateFileInfo(fs, opener, fi, name, "", nil), nil
+		return decorateFileInfo("filename-decorator", fs, opener, fi, name, "", nil), nil
 	}
 
 	ffs.decorate = decorator
@@ -76,7 +94,7 @@ func NewCompositeDirDecorator(fs afero.Fs) *FilenameDecoratorFs {
 		opener := func() (afero.File, error) {
 			return fs.Open(name)
 		}
-		return decorateFileInfo(fs, opener, fi, "", "", nil), nil
+		return decorateFileInfo("composite-decorator", fs, opener, fi, "", "", nil), nil
 	}
 
 	return &FilenameDecoratorFs{Fs: fs, decorate: decorator}

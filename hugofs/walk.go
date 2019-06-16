@@ -116,7 +116,7 @@ func (w *Walkway) walk(fs afero.Fs, info FileMetaInfo, walkFn WalkFunc) error {
 	f, err := meta.Open()
 
 	if err != nil {
-		return walkFn(info, err)
+		return walkFn(info, errors.Wrap(err, "walk"))
 	}
 
 	fis, err := f.Readdir(-1)

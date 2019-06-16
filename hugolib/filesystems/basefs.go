@@ -716,10 +716,6 @@ func (b *sourceFilesystemsBuilder) createMainOverlayFs(projectMounts mountsDescr
 
 	mods := p.AllModules
 
-	if len(mods) == 0 {
-		panic("AllModules not set")
-	}
-
 	modsReversed := make([]mountsDescriptor, len(mods)+1)
 
 	modsReversed[0] = projectMounts
@@ -743,6 +739,7 @@ func (b *sourceFilesystemsBuilder) createMainOverlayFs(projectMounts mountsDescr
 	err := b.createOverlayFs(collector, modsReversed)
 
 	collector.overlay = hugofs.NewCompositeDirDecorator(collector.overlay)
+
 	return collector, err
 
 }
@@ -784,6 +781,8 @@ func (b *sourceFilesystemsBuilder) createModFs(
 	if !md.isMainProject {
 		modBase = collector.sourceModules
 	}
+
+	modBase = hugofs.NewPathDecorator(modBase, md.dir)
 
 	rmfs, err := hugofs.NewRootMappingFs(modBase, fromTo...)
 	if err != nil {
@@ -861,6 +860,15 @@ type filesystemsCollector struct {
 	// TODO(bep) mod static
 	layoutsDirs []hugofs.FileMetaInfo
 	assetsDirs  []hugofs.FileMetaInfo
+}
+
+func (c *filesystemsCollector) reverseFileMetaInfos(fis []hugofs.FileMetaInfo) []hugofs.FileMetaInfo {
+	for i := len(fis)/2 - 1; i >= 0; i-- {
+		opp := len(fis) - 1 - i
+		fis[i], fis[opp] = fis[opp], fis[i]
+	}
+
+	return fis
 }
 
 type mountsDescriptor struct {

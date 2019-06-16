@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -53,7 +54,7 @@ func NewLanguageFs(langs map[string]bool, sources ...FileMeta) (afero.Fs, error)
 		for i, fi := range fis {
 			if fi.IsDir() {
 				filename := filepath.Join(name, fi.Name())
-				fisn[i] = decorateFileInfo(fs, fs.getOpener(filename), fi, "", "", nil)
+				fisn[i] = decorateFileInfo("languagefs-dir", fs, fs.getOpener(filename), fi, "", "", nil)
 				continue
 			}
 
@@ -163,7 +164,7 @@ func NewSliceFs(sources ...FileMeta) (afero.Fs, error) {
 			if fi.IsDir() {
 				// Make sure any dir is opened by us.
 				filename := filepath.Join(name, fi.Name())
-				fisn[i] = decorateFileInfo(fs, fs.getOpener(filename), fi, "", "", nil)
+				fisn[i] = decorateFileInfo("slicefs-dir", fs, fs.getOpener(filename), fi, "", "", nil)
 				continue
 			} else {
 				fisn[i] = fi
@@ -212,7 +213,7 @@ func (fs *SliceFs) LstatIfPossible(name string) (os.FileInfo, bool, error) {
 	}
 
 	if fi.IsDir() {
-		return decorateFileInfo(fs, fs.getOpener(name), fi, "", "", nil), false, nil
+		return decorateFileInfo("slicefs-stat", fs, fs.getOpener(name), fi, "", "", nil), false, nil
 	}
 
 	return nil, false, errors.Errorf("lstat: files not supported: %q", name)
@@ -411,16 +412,17 @@ func (f *sliceDir) WriteString(s string) (ret int, err error) {
 }
 
 func decorateFileInfo(
+	id string,
 	fs afero.Fs,
 	opener func() (afero.File, error),
 	fi os.FileInfo,
 	filename,
-	path string,
+	filepath string,
 	inMeta FileMeta) os.FileInfo {
 
-	path = strings.TrimPrefix(path, string(os.PathSeparator))
-
 	var meta FileMeta
+
+	filepath = strings.TrimPrefix(filepath, string(os.PathSeparator))
 
 	if fim, ok := fi.(FileMetaInfo); ok {
 		meta = fim.Meta()
@@ -434,6 +436,12 @@ func decorateFileInfo(
 
 	}
 
+	if idv, ok := meta["id"]; ok {
+		meta["id"] = path.Join(idv.(string), id)
+	} else {
+		meta["id"] = id
+	}
+
 	if opener != nil {
 		meta[metaKeyOpener] = opener
 	}
@@ -442,7 +450,7 @@ func decorateFileInfo(
 		meta.setIfNotZero(metaKeyFs, fs)
 	}
 
-	meta.setIfNotZero(metaKeyPath, path)
+	meta.setIfNotZero(metaKeyPath, filepath)
 	meta.setIfNotZero(metaKeyFilename, filename)
 
 	mergeFileMeta(inMeta, meta)

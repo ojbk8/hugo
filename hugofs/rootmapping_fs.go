@@ -203,7 +203,7 @@ func (fs *RootMappingFs) LstatIfPossible(name string) (os.FileInfo, bool, error)
 
 	path := root.path(name)
 
-	return decorateFileInfo(fs.Fs, opener, fi, filename, path, root.Meta), b, nil
+	return decorateFileInfo("rootmapping-fs", fs.Fs, opener, fi, filename, path, root.Meta), b, nil
 }
 
 // Open opens the named file for reading.
@@ -342,7 +342,7 @@ func (f *rootMappingFile) Readdir(count int) ([]os.FileInfo, error) {
 	}
 
 	for i, fi := range fis {
-		fis[i] = decorateFileInfo(f.fs.Fs, nil, fi, "", f.rm.path(filepath.Join(f.Name(), fi.Name())), f.rm.Meta)
+		fis[i] = decorateFileInfo("rootmapping-file", f.fs.Fs, nil, fi, "", f.rm.path(filepath.Join(f.Name(), fi.Name())), f.rm.Meta)
 	}
 
 	return fis, nil

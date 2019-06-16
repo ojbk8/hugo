@@ -33,7 +33,6 @@ import (
 
 	"github.com/bep/gitmap"
 	"github.com/gohugoio/hugo/config"
-	"github.com/spf13/afero"
 
 	"github.com/gohugoio/hugo/publisher"
 
@@ -288,7 +287,7 @@ func newHugoSites(cfg deps.DepsCfg, sites ...*Site) (*HugoSites, error) {
 	}
 
 	h.init.data.Add(func() (interface{}, error) {
-		err := h.loadData(h.PathSpec.BaseFs.Data.Fs)
+		err := h.loadData(h.PathSpec.BaseFs.Data.Dirs)
 		if err != nil {
 			return nil, errors.Wrap(err, "failed to load data")
 		}
@@ -806,17 +805,20 @@ func (h *HugoSites) Pages() page.Pages {
 	return h.Sites[0].AllPages()
 }
 
-func (h *HugoSites) loadData(fs afero.Fs) (err error) {
-	spec := source.NewSourceSpec(h.PathSpec, fs)
-	fileSystem := spec.NewFilesystem("")
+func (h *HugoSites) loadData(fis []hugofs.FileMetaInfo) (err error) {
+	spec := source.NewSourceSpec(h.PathSpec, nil)
+
 	h.data = make(map[string]interface{})
-	files, err := fileSystem.Files()
-	if err != nil {
-		return err
-	}
-	for _, r := range files {
-		if err := h.handleDataFile(r); err != nil {
+	for _, fi := range fis {
+		fileSystem := spec.NewFilesystemFromFileMetaInfo(fi)
+		files, err := fileSystem.Files()
+		if err != nil {
 			return err
+		}
+		for _, r := range files {
+			if err := h.handleDataFile(r); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -835,7 +837,7 @@ func (h *HugoSites) handleDataFile(r source.ReadableFile) error {
 	// Crawl in data tree to insert data
 	current = h.data
 	keyParts := strings.Split(r.Dir(), helpers.FilePathSeparator)
-	for _, key := range keyParts {
+	for _, key := range keyParts[1:] {
 		if key != "" {
 			if _, ok := current[key]; !ok {
 				current[key] = make(map[string]interface{})
