@@ -14,10 +14,13 @@
 package hugofs
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/pkg/errors"
 
 	"github.com/gohugoio/hugo/htesting"
 
@@ -145,5 +148,53 @@ func collectFilenames(fs afero.Fs, workDir, root string) ([]string, error) {
 	err := w.Walk()
 
 	return names, err
+
+}
+
+func BenchmarkWalk(b *testing.B) {
+	assert := require.New(b)
+	fs := NewFilenameDecorator(afero.NewMemMapFs())
+
+	writeFiles := func(dir string, numfiles int) {
+		for i := 0; i < numfiles; i++ {
+			filename := filepath.Join(dir, fmt.Sprintf("file%d.txt", i))
+			assert.NoError(afero.WriteFile(fs, filename, []byte("content"), 0777))
+		}
+	}
+
+	const numFilesPerDir = 20
+
+	writeFiles("root", numFilesPerDir)
+	writeFiles("root/l1_1", numFilesPerDir)
+	writeFiles("root/l1_1/l2_1", numFilesPerDir)
+	writeFiles("root/l1_1/l2_2", numFilesPerDir)
+	writeFiles("root/l1_2", numFilesPerDir)
+	writeFiles("root/l1_2/l2_1", numFilesPerDir)
+	writeFiles("root/l1_3", numFilesPerDir)
+
+	walkFn := func(info FileMetaInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return nil
+		}
+
+		filename := info.Meta().Filename()
+		if !strings.HasPrefix(filename, "root") {
+			return errors.New(filename)
+		}
+
+		return nil
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		w := NewWalkway(fs, "root", walkFn)
+
+		if err := w.Walk(); err != nil {
+			b.Fatal(err)
+		}
+	}
 
 }

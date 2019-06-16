@@ -51,7 +51,6 @@ func NewWalkwayFromFi(fi FileMetaInfo, walkFn WalkFunc) *Walkway {
 		seen:   make(map[string]bool)}
 }
 
-// TODO(bep) symlinks
 // TODO(bep) make content use this
 func (w *Walkway) Walk() error {
 	if w.walked {
@@ -87,16 +86,9 @@ func lstatIfPossible(fs afero.Fs, path string) (os.FileInfo, error) {
 	return fs.Stat(path)
 }
 
-var counter int
-
 // walk recursively descends path, calling walkFn.
 // It follow symlinks if supported by the filesystem, but only the same path once.
 func (w *Walkway) walk(fs afero.Fs, info FileMetaInfo, walkFn WalkFunc) error {
-	counter++
-	// TODO(bep) mod remove this
-	if counter > 50 {
-		panic("bailout")
-	}
 	err := walkFn(info, nil)
 	if err != nil {
 		if info.IsDir() && err == filepath.SkipDir {
